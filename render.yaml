@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: vip-informe
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 2 --threads 4 --timeout 120
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: FLASK_SECRET_KEY
+        generateValue: true
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
