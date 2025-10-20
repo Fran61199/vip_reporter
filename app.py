@@ -6,6 +6,20 @@ from datetime import datetime
 from flask import Flask, request, render_template, send_file, jsonify
 import pdfplumber
 from docx import Document
+# === Rutas absolutas para encontrar la plantilla ===
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMPLATE_FOLDER_USER = os.getenv("TEMPLATE_FOLDER_USER", "user_templates")
+USER_TEMPLATES_DIR = os.path.join(BASE_DIR, TEMPLATE_FOLDER_USER)
+
+# Candidatos de plantilla (en orden de prioridad)
+CANDIDATE_PLANTILLAS = [
+    os.path.join(USER_TEMPLATES_DIR, "plantilla.docx"),  # <- user_templates/plantilla.docx
+    os.path.join(BASE_DIR, "plantilla.docx"),            # raíz
+    os.path.join(BASE_DIR, "templates", "plantilla.docx"),
+    os.path.join(BASE_DIR, "template", "plantilla.docx"),
+]
+
+PLANTILLA_PATH = next((p for p in CANDIDATE_PLANTILLAS if os.path.exists(p)), None)
 
 # ====== Config ======
 MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
