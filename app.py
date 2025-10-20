@@ -1,103 +1,346 @@
-import os
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os, re, io, zipfile, traceback, json
 from datetime import datetime
-from flask import Flask, render_template, request, redirect, url_for, send_file, flash
-from werkzeug.utils import secure_filename
-from dotenv import load_dotenv
-import io
+from flask import Flask, request, render_template, send_file, jsonify
+import pdfplumber
+from docx import Document
 
-from utils.pdf_reader import extract_text_from_pdfs
-from services.llm import build_report_body
-from report.docx_writer import build_docx_from_body, fill_template_docx
+# ====== Config ======
+MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+MAX_CHARS_GPT = 12000
+ESTIMAR_MODO = "limpio"  # "limpio" | "claves"
 
-# --- App config ---
-load_dotenv()
-UPLOAD_FOLDER = os.environ.get("UPLOAD_FOLDER", "uploads")
-TEMPLATE_FOLDER_USER = os.environ.get("TEMPLATE_FOLDER_USER", "user_templates")
-ALLOWED_EXTENSIONS = {"pdf", "docx"}
-MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB
-
+# ====== App / carpetas ======
+app = Flask(__name__)
+UPLOAD_FOLDER = "uploads"
+OUTPUT_FOLDER = "outputs"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(TEMPLATE_FOLDER_USER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-app = Flask(__name__, template_folder="templates", static_folder="static")
-app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
-app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
-app.secret_key = os.environ.get("FLASK_SECRET_KEY", "dev-secret-key")
+# ====== Limpieza de texto ======
+PATTERNS = [
+    r'https?://\S+',
+    r'===\s*Página.*?===',
+    r'\d{2}/\d{2}/\d{2},\s*\d{1,2}:\d{2}\s*(a|p)\.m\.',
+    r'\(\*\)\s*Dato\s*Modificado',
+    r'Firma y Sello.*',
+    r'Nombre,?\s*Firma.*',
+    r'Formato de Impresion',
+    r'Fecha de (Registro|Revisión).*',
+    r'\s{2,}'
+]
+def limpiar_texto(texto: str) -> str:
+    for p in PATTERNS:
+        texto = re.sub(p, '', texto, flags=re.IGNORECASE)
+    texto = texto.replace(' \n', '\n').replace('\n ', '\n')
+    texto = re.sub(r'[ \t]+', ' ', texto)
+    texto = re.sub(r'(?i)\b(CONCLUSIONES|RECOMENDACIONES|DIAGN[ÓO]STICOS?)\b', r'\n\n\1\n', texto)
+    texto = re.sub(r'\n{3,}', '\n\n', texto)
+    return texto.strip()
 
-def allowed_file(filename):
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+# ====== Clasificación ======
+CATEGORIAS = [
+    ("LABORATORIO", [r'INFORME DE LABORATORIO', r'EXAMEN DE LABORATORIO', r'HEMOGRAMA', r'BIOQUIMICA']),
+    ("CARDIOLOGIA", [r'ELECTROCARDIOGRAF', r'CARDIOVASCULAR', r'EKG']),
+    ("AUDIOLOGIA", [r'AUDIOL', r'OTOSCOPIA', r'OTORRINO']),
+    ("DERMATOLOGIA", [r'DERMATOL']),
+    ("ECOGRAFIA ABDOMINAL", [r'ECOGRAF(IA|ICA)\s+ABDOM']),
+    ("ECOGRAFIA PELVICA", [r'ECOGRAF(IA|ICA)\s+PELV']),
+    ("HISTORIA CLINICA", [r'HISTORIA CLINICA MEDICA OCUPACIONAL', r'HISTORIA CL[IÍ]NICA']),
+    ("MUSCULO ESQUELETICO", [r'MUSCULO', r'ESQUEL[EÉ]TICA']),
+    ("NEUROLOGIA", [r'NEUROL']),
+    ("ODONTOLOGIA", [r'ODONTO', r'ODONTOGRAMA']),
+    ("OFTALMOLOGIA", [r'OFTALMO']),
+    ("PRUEBA DE ESFUERZO", [r'PRUEBA DE ESFUERZO', r'PROTOCOLO BRUCE']),
+    ("PSICOLOGIA", [r'PSICOL', r'EPWORTH']),
+    ("UROLOGIA", [r'UROL']),
+    ("RADIOLOGIA", [r'RADIOGRA', r'TÓRAX']),
+    ("ESPIROMETRIA", [r'ESPIROM']),
+]
+def clasificar(texto: str) -> str:
+    upper = texto.upper()
+    for nombre, pats in CATEGORIAS:
+        for pat in pats:
+            if re.search(pat, upper):
+                return nombre
+    return "OTROS"
+
+# ====== Extracción PDF ======
+def extraer_texto_pdf(pdf_path: str) -> str:
+    partes = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            txt = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
+            txt = txt.strip()
+            if txt:
+                partes.append(txt)
+    return "\n\n".join(partes)
+
+# ====== Estimación (solo UI) ======
+def estimar_tokens_aprox(texto: str) -> int:
+    return max(1, len(texto) // 4)  # ~1 token ≈ 4 chars
+
+def extraer_solo_claves(texto: str) -> str:
+    keep = []
+    for tag in [r'(?is)\bCONCLUSIONES\b.*?(?=\n[A-ZÁÉÍÓÚÑ ]{3,}|$)',
+                r'(?is)\bDIAGN[ÓO]STICOS?\b.*?(?=\n[A-ZÁÉÍÓÚÑ ]{3,}|$)',
+                r'(?is)\bRECOMENDACIONES\b.*?(?=\n[A-ZÁÉÍÓÚÑ ]{3,}|$)']:
+        m = re.search(tag, texto)
+        if m:
+            keep.append(m.group(0))
+    if not keep:
+        keep = ["\n".join(texto.splitlines()[:8])]
+    s = "\n\n".join(keep)
+    s = re.sub(r'\s{2,}', ' ', s)
+    return s.strip()
+
+# ====== DOCX ======
+def _replace_in_paragraph(paragraph, mapping):
+    for key, val in mapping.items():
+        placeholder = f'{{{{{key}}}}}'
+        if placeholder in paragraph.text:
+            paragraph.text = paragraph.text.replace(placeholder, val)
+
+def _replace_in_document(doc: Document, mapping: dict):
+    for p in doc.paragraphs:
+        _replace_in_paragraph(p, mapping)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    _replace_in_paragraph(p, mapping)
+
+def generar_docx(datos: dict, plantilla_path: str, salida_path: str):
+    from docx.shared import Pt
+    doc = Document(plantilla_path)
+    _replace_in_document(doc, datos)
+    # Forzar Calibri 11
+    for p in doc.paragraphs:
+        for run in p.runs:
+            run.font.name = "Calibri"
+            run.font.size = Pt(11)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    for run in p.runs:
+                        run.font.name = "Calibri"
+                        run.font.size = Pt(11)
+    doc.save(salida_path)
+
+# ====== GPT ======
+def redactar_vip_con_gpt(paciente: str, insumo: str) -> str:
+    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("openai_api_key")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY no configurada")
+
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+
+        insumo = insumo[:MAX_CHARS_GPT]
+
+        system_msg = (
+  "Eres médico ocupacional y redactas informes VIP con tono profesional, claro y empático. "
+  "Escribe SIEMPRE en SEGUNDA PERSONA de cortesía (usted). "
+  "No uses 'el paciente'/'la paciente' ni tercera persona. "
+  "Estructura en párrafos independientes, sin títulos gruesos, salvo la sección final de recomendaciones en viñetas. "
+  "Incluye valores y unidades cuando estén en el insumo y ofrece interpretaciones breves. "
+  "No inventes nada: si un dato no aparece, no lo supongas ni lo rellenes. "
+  "Respeta la evidencia del insumo y evita repetir texto administrativo. "
+  "ESPAÑOL neutro de salud ocupacional."
+)
+        prompt = f"""Redacta el CUERPO de un informe VIP con el siguiente insumo clínico ya limpio.
+Tono y forma:
+- Segunda persona (usted) SIEMPRE. Evita frases como “el paciente…”.
+- Párrafos breves (3–5 oraciones), separados por líneas en blanco.
+- Cierre con recomendaciones en viñetas (máximo 5), claras y accionables.
+
+Orden sugerido:
+1) Contexto general: edad y antecedentes relevantes (familiares, personales, alergias, cirugías si aplica).
+2) Examen físico: peso/talla/IMC si están disponibles, PA, FC; interpretación breve.
+3) Hallazgos por especialidad (solo si aparecen en el insumo), por ejemplo:
+   - Oftalmología
+   - Cardiología (EKG/prueba de esfuerzo)
+   - Audiología/ORL
+   - Tórax/Espirometría
+   - Radiología (incluye columna si procede)
+   - Odontología
+   - Músculo-esquelético
+   - Ecografías (abdominal/pélvica)
+   - Urología
+4) Laboratorio: hemograma, glucosa, perfil lipídico, orina, PSA/tiroides/marcadores (solo lo disponible).
+5) Cierre + “En conclusión” y recomendaciones en viñetas.
+
+Reglas:
+- No repitas nombres de empresa, sellos ni datos administrativos.
+- Usa cifras con unidades y corta interpretación (p.ej., “IMC 26.2 kg/m²: rango de sobrepeso”).
+- Si una especialidad no aparece en el insumo, omítela.
+- Evita listados largos dentro de párrafos; prioriza claridad clínica.
+- No inventes rangos de referencia si no están en el insumo.
+
+INSUMO:
+{insumo}
+""".strip()
+
+        resp = client.chat.completions.create(
+            model=MODEL_NAME,
+            temperature=0.4,
+            max_tokens=900,
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": prompt}
+            ]
+        )
+
+        texto = resp.choices[0].message.content.strip()
+        # Normalización defensiva de viñetas
+        partes = texto.split("\n")
+        limpio = []
+        en_reco = False
+        for ln in partes:
+            if ln.strip().lower().startswith("recomendaciones"):
+                en_reco = True
+                limpio.append("Recomendaciones:")
+                continue
+            if not en_reco and (ln.strip().startswith("•") or ln.strip().startswith("- ")):
+                ln = ln.lstrip("•- ").strip()
+            limpio.append(ln)
+        return "\n".join(limpio).strip()
+
+    except Exception as e:
+        print("Error GPT:", e)
+        traceback.print_exc()
+        raise
+
+# ========= Rutas =========
 
 @app.route("/", methods=["GET"])
-def index():
+def home():
     return render_template("index.html")
 
-@app.route("/upload", methods=["POST"])
-def upload():
-    if "pdfs" not in request.files:
-        flash("No se adjuntaron archivos.")
-        return redirect(url_for("index"))
+@app.route("/preview", methods=["POST"])
+def preview():
+    """
+    Procesa SOLO para vista previa:
+    - No persiste .docx
+    - Opcionalmente puede guardar .txt en outputs/ (útil para debug)
+    Devuelve JSON con previews y totales.
+    """
+    archivos = request.files.getlist("pdfs")
+    if not archivos or all(not f.filename.lower().endswith(".pdf") for f in archivos):
+        return jsonify({"ok": False, "error": "Adjunta al menos un PDF válido."}), 400
 
-    pdf_files = request.files.getlist("pdfs")
-    saved_paths = []
-    for f in pdf_files:
-        if f and allowed_file(f.filename) and f.filename.lower().endswith(".pdf"):
-            filename = secure_filename(f.filename)
-            path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-            f.save(path)
-            saved_paths.append(path)
+    resultados, total_tokens = [], 0
+    cat_a_texto = {}
 
-    template_file = request.files.get("template_docx")
-    template_path = None
-    if template_file and allowed_file(template_file.filename) and template_file.filename.lower().endswith(".docx"):
-        tname = secure_filename(template_file.filename)
-        template_path = os.path.join(TEMPLATE_FOLDER_USER, tname)
-        template_file.save(template_path)
+    for i, pdf in enumerate(archivos):
+        if not pdf.filename.lower().endswith(".pdf"):
+            continue
+        ruta_pdf = os.path.join(UPLOAD_FOLDER, f"__preview_{i}_" + pdf.filename)
+        pdf.save(ruta_pdf)
 
-    # Patient metadata
-    city = request.form.get("city", "Lima")
-    date_str = request.form.get("date_str") or datetime.now().strftime("%d de %B del %Y")
-    addressee = request.form.get("addressee", "").strip()
-    name = request.form.get("patient_name", "").strip()
-    hc = request.form.get("hc", "").strip()
-    edad = request.form.get("edad", "").strip()
+        crudo = extraer_texto_pdf(ruta_pdf)
+        limpio = limpiar_texto(crudo)
+        categoria = clasificar(limpio)
 
-    if not saved_paths:
-        flash("Sube al menos un PDF de resultados.")
-        return redirect(url_for("index"))
+        # (Opcional) guardar txt de preview:
+        salida_fn = f"{i+1:02d}_{categoria}.txt"
+        ruta_txt = os.path.join(OUTPUT_FOLDER, salida_fn)
+        with open(ruta_txt, "w", encoding="utf-8") as f:
+            f.write(limpio)
 
-    # Read PDFs and call LLM
-    raw_text = extract_text_from_pdfs(saved_paths)
-    body = build_report_body(raw_text, patient_name=name, edad=edad)
+        cat_a_texto.setdefault(categoria, []).append(limpio)
 
-    # Build DOCX (template first if provided)
-    if template_path:
-        doc_bytes = fill_template_docx(
-            template_path=template_path,
-            ciudad=city,
-            fecha=date_str,
-            destinatario=addressee,
-            paciente=name,
-            hc=hc,
-            body=body
-        )
-    else:
-        doc_bytes = build_docx_from_body(
-            ciudad=city,
-            fecha=date_str,
-            destinatario=addressee,
-            paciente=name,
-            hc=hc,
-            body=body
-        )
+        base = extraer_solo_claves(limpio) if ESTIMAR_MODO == "claves" else limpio
+        tokens_aprox = estimar_tokens_aprox(base)
+        total_tokens += tokens_aprox
 
-    out_filename = f"Informe_{secure_filename(name or 'PacienteVIP')}_{datetime.now().strftime('%Y%m%d_%H%M')}.docx"
-    return send_file(
-        io.BytesIO(doc_bytes),
-        mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        as_attachment=True,
-        download_name=out_filename
-    )
+        resultados.append({
+            "filename": pdf.filename,
+            "categoria": categoria,
+            "txt_name": salida_fn,
+            "preview": (limpio[:900] + ("..." if len(limpio) > 900 else "")),
+            "tokens": tokens_aprox
+        })
+
+    return jsonify({"ok": True, "resultados": resultados, "total_tokens": total_tokens})
+
+@app.route("/generate-docx", methods=["POST"])
+def generate_docx():
+    # Campos
+    nombre = request.form.get("nombre", "").strip()
+    ape1   = request.form.get("ape1", "").strip()
+    ape2   = request.form.get("ape2", "").strip()
+    hc     = request.form.get("hc", "").strip()
+    sexo   = request.form.get("sexo", "M").strip().upper()
+
+    if not nombre or not ape1 or not hc:
+        return "Faltan campos obligatorios (Nombre, Primer Apellido, H.C.).", 400
+
+    archivos = request.files.getlist("pdfs")
+    if not archivos or all(not f.filename.lower().endswith(".pdf") for f in archivos):
+        return "Debes adjuntar al menos un PDF válido.", 400
+
+    trato = "Señor" if sexo == "M" else "Señora"
+    saludo_adj = "Estimado" if sexo == "M" else "Estimada"
+    apellido = (ape1.split()[0] if ape1 else "").capitalize()
+
+    # Fecha Lima
+    meses = ["enero","febrero","marzo","abril","mayo","junio","julio","agosto","septiembre","octubre","noviembre","diciembre"]
+    hoy = datetime.now()
+    fecha_str = f"Lima, {hoy.day} de {meses[hoy.month-1]} del {hoy.year}"
+
+    # Procesar PDFs y armar insumo
+    cat_a_texto = {}
+    for i, pdf in enumerate(archivos):
+        if not pdf.filename.lower().endswith(".pdf"):
+            continue
+        ruta_pdf = os.path.join(UPLOAD_FOLDER, pdf.filename)
+        pdf.save(ruta_pdf)
+
+        crudo = extraer_texto_pdf(ruta_pdf)
+        limpio = limpiar_texto(crudo)
+        categoria = clasificar(limpio)
+
+        # Guardar .txt por examen 
+        salida_fn = f"{i+1:02d}_{categoria}.txt"
+        ruta_txt = os.path.join(OUTPUT_FOLDER, salida_fn)
+        with open(ruta_txt, "w", encoding="utf-8") as f:
+            f.write(limpio)
+
+        cat_a_texto.setdefault(categoria, []).append(limpio)
+
+    bloques = []
+    for cat, textos in cat_a_texto.items():
+        bloques.append(f"### {cat}\n" + "\n".join(textos))
+    insumo_completo = "\n\n".join(bloques).strip()
+
+    if not os.getenv("OPENAI_API_KEY") and not os.getenv("openai_api_key"):
+        return "Error: OPENAI_API_KEY no configurada en el entorno.", 400
+    if not insumo_completo:
+        return "Error: no se pudo construir el texto base de los PDFs.", 400
+
+    paciente = f"{nombre} {ape1} {ape2}".strip()
+    cuerpo = redactar_vip_con_gpt(paciente, insumo_completo)
+
+    # Generar DOCX
+    datos = {
+        "FECHA": fecha_str,
+        "SEXO_TRATO": trato,
+        "NOMBRE_COMPLETO": paciente,
+        "HC": hc,
+        "SEXO_ADJETIVO": saludo_adj,
+        "APELLIDO": apellido,
+        "CUERPO": cuerpo or "(Contenido pendiente)"
+    }
+    salida_docx = os.path.join(OUTPUT_FOLDER, f"Informe_{apellido or 'Paciente'}.docx")
+    generar_docx(datos, "plantilla.docx", salida_docx)
+
+    return send_file(salida_docx, as_attachment=True, download_name=os.path.basename(salida_docx))
+
 
 if __name__ == "__main__":
-    # Local dev
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
+    app.run(debug=True)
