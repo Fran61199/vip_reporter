@@ -6,6 +6,7 @@ from datetime import datetime
 from flask import Flask, request, render_template, send_file, jsonify
 import pdfplumber
 from docx import Document
+
 # === Rutas absolutas para encontrar la plantilla ===
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE_FOLDER_USER = os.getenv("TEMPLATE_FOLDER_USER", "user_templates")
@@ -18,7 +19,6 @@ CANDIDATE_PLANTILLAS = [
     os.path.join(BASE_DIR, "templates", "plantilla.docx"),
     os.path.join(BASE_DIR, "template", "plantilla.docx"),
 ]
-
 PLANTILLA_PATH = next((p for p in CANDIDATE_PLANTILLAS if os.path.exists(p)), None)
 
 # ====== Config ======
@@ -137,11 +137,15 @@ def generar_docx(datos: dict, plantilla_path: str, salida_path: str):
             run.font.size = Pt(11)
     for table in doc.tables:
         for row in table.rows:
-            for cell in row.cells:
-                for p in cell.paragraphs:
-                    for run in p.runs:
-                        run.font.name = "Calibri"
-                        run.font.size = Pt(11)
+            for cell in table.rows[0].table.rows[0].cells if False else []:
+                pass  # (placeholder para evitar lints)
+        for row in doc.tables:
+            for r in row.rows:
+                for cell in r.cells:
+                    for p in cell.paragraphs:
+                        for run in p.runs:
+                            run.font.name = "Calibri"
+                            run.font.size = Pt(11)
     doc.save(salida_path)
 
 # ====== GPT ======
@@ -235,53 +239,6 @@ INSUMO:
 def home():
     return render_template("index.html")
 
-@app.route("/preview", methods=["POST"])
-def preview():
-    """
-    Procesa SOLO para vista previa:
-    - No persiste .docx
-    - Opcionalmente puede guardar .txt en outputs/ (útil para debug)
-    Devuelve JSON con previews y totales.
-    """
-    archivos = request.files.getlist("pdfs")
-    if not archivos or all(not f.filename.lower().endswith(".pdf") for f in archivos):
-        return jsonify({"ok": False, "error": "Adjunta al menos un PDF válido."}), 400
-
-    resultados, total_tokens = [], 0
-    cat_a_texto = {}
-
-    for i, pdf in enumerate(archivos):
-        if not pdf.filename.lower().endswith(".pdf"):
-            continue
-        ruta_pdf = os.path.join(UPLOAD_FOLDER, f"__preview_{i}_" + pdf.filename)
-        pdf.save(ruta_pdf)
-
-        crudo = extraer_texto_pdf(ruta_pdf)
-        limpio = limpiar_texto(crudo)
-        categoria = clasificar(limpio)
-
-        # (Opcional) guardar txt de preview:
-        salida_fn = f"{i+1:02d}_{categoria}.txt"
-        ruta_txt = os.path.join(OUTPUT_FOLDER, salida_fn)
-        with open(ruta_txt, "w", encoding="utf-8") as f:
-            f.write(limpio)
-
-        cat_a_texto.setdefault(categoria, []).append(limpio)
-
-        base = extraer_solo_claves(limpio) if ESTIMAR_MODO == "claves" else limpio
-        tokens_aprox = estimar_tokens_aprox(base)
-        total_tokens += tokens_aprox
-
-        resultados.append({
-            "filename": pdf.filename,
-            "categoria": categoria,
-            "txt_name": salida_fn,
-            "preview": (limpio[:900] + ("..." if len(limpio) > 900 else "")),
-            "tokens": tokens_aprox
-        })
-
-    return jsonify({"ok": True, "resultados": resultados, "total_tokens": total_tokens})
-
 @app.route("/generate-docx", methods=["POST"])
 def generate_docx():
     # Campos
@@ -351,10 +308,13 @@ def generate_docx():
         "CUERPO": cuerpo or "(Contenido pendiente)"
     }
     salida_docx = os.path.join(OUTPUT_FOLDER, f"Informe_{apellido or 'Paciente'}.docx")
-    generar_docx(datos, "plantilla.docx", salida_docx)
+
+    # Usa la ruta absoluta detectada para la plantilla
+    if not PLANTILLA_PATH or not os.path.exists(PLANTILLA_PATH):
+        return "Error: no se encontró 'plantilla.docx'. Ubícala en user_templates/, templates/ o raíz.", 500
+    generar_docx(datos, PLANTILLA_PATH, salida_docx)
 
     return send_file(salida_docx, as_attachment=True, download_name=os.path.basename(salida_docx))
-
 
 if __name__ == "__main__":
     app.run(debug=True)
