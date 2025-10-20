@@ -11,3 +11,5 @@ services:
         generateValue: true
       - key: OPENAI_MODEL
         value: gpt-4o-mini
+      - key: TEMPLATE_FOLDER_USER
+        value: user_templates
