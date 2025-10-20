@@ -16,14 +16,13 @@
     button { border:0; background:#003678; color:#fff; padding:10px 14px; border-radius:8px; cursor:pointer; }
     button:hover { opacity:.95; }
     .muted { color:#6b7280; }
-    table { width:100%; border-collapse:collapse; background:#fff; }
-    th, td { border:1px solid #e5e7eb; padding:8px 10px; text-align:left; vertical-align:top; }
-    th { background:#f3f4f6; }
-    code { background:#f6f8fa; padding:2px 6px; border-radius:6px; }
-    pre { white-space:pre-wrap; background:#f6f8fa; padding:12px; border-radius:8px; border:1px solid #e5e7eb; }
-    details { margin:.5rem 0; }
-    .error { color:#b91c1c; background:#fee2e2; border:1px solid #fecaca; padding:10px; border-radius:8px; }
-    .right { text-align:right; }
+
+    /* Overlay de carga con barra de progreso */
+    .overlay { position: fixed; inset: 0; background: rgba(255,255,255,0.85); display: none; align-items: center; justify-content: center; z-index: 9999; }
+    .overlay-box { background:#fff; border:1px solid #e5e7eb; border-radius:12px; padding:22px 26px; box-shadow: 0 10px 30px rgba(0,0,0,0.1); text-align:center; color:#111827; width: 320px; }
+    .progress { width:100%; height:16px; background:#e5e7eb; border-radius:8px; overflow:hidden; margin:10px 0 6px; }
+    .bar { width:0%; height:100%; background:#003678; transition:width .25s ease; }
+    .pct { font-variant-numeric: tabular-nums; }
   </style>
 </head>
 <body>
@@ -60,114 +59,116 @@
         <input id="pdfs" type="file" name="pdfs" multiple required accept=".pdf">
       </p>
 
-      <button type="submit">Generar informe con GPT (descarga directa)</button>
-      
+      <button id="btn-submit" type="submit">Generar informe con GPT (descarga directa)</button>
+      <p class="muted" style="margin-top:8px;">
+        Se genera un <b>.docx</b> con la plantilla y se descarga automáticamente.
+      </p>
     </form>
   </div>
 
-  <div class="card" id="preview-card" style="display:none;">
-    <h2>Clasificación por examen (preview)</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>PDF</th>
-          <th>Categoría</th>
-          <th>Archivo (txt)</th>
-          <th class="right">Tokens ~</th>
-        </tr>
-      </thead>
-      <tbody id="preview-rows"></tbody>
-      <tfoot>
-        <tr>
-          <td colspan="3" class="right"><b>Total tokens ~</b></td>
-          <td class="right"><b id="preview-total">0</b></td>
-        </tr>
-      </tfoot>
-    </table>
-
-    <h3>Vistas previas</h3>
-    <div id="preview-details"></div>
+  <!-- Overlay de carga con barra -->
+  <div id="overlay" class="overlay" aria-hidden="true">
+    <div class="overlay-box">
+      <div class="progress"><div id="bar" class="bar"></div></div>
+      <div class="pct"><span id="pct">0</span>%</div>
+      <div>Generando informe, por favor espere…</div>
+    </div>
   </div>
 
   <script>
-    const $pdfs = document.getElementById('pdfs');
-    const $previewCard = document.getElementById('preview-card');
-    const $previewRows = document.getElementById('preview-rows');
-    const $previewTotal = document.getElementById('preview-total');
-    const $previewDetails = document.getElementById('preview-details');
     const $form = document.getElementById('form-vip');
+    const $btn = document.getElementById('btn-submit');
+    const $overlay = document.getElementById('overlay');
+    const $pdfs = document.getElementById('pdfs');
+    const $bar = document.getElementById('bar');
+    const $pct = document.getElementById('pct');
 
-    // 1) Vista previa inmediata al adjuntar PDFs
-    $pdfs.addEventListener('change', async () => {
-      if (!$pdfs.files.length) { $previewCard.style.display = 'none'; return; }
-      const fd = new FormData();
-      for (const f of $pdfs.files) fd.append('pdfs', f);
+    let timer = null, progress = 0;
 
-      // Llamada a /preview
-      const res = await fetch('/preview', { method: 'POST', body: fd });
-      const data = await res.json().catch(() => ({}));
+    function startProgress() {
+      progress = 0;
+      $bar.style.width = '0%';
+      $pct.textContent = '0';
+      // Sube suave hasta 95%
+      timer = setInterval(() => {
+        const inc = Math.random() * 6; // 0–6%
+        progress = Math.min(progress + inc, 95);
+        $bar.style.width = progress.toFixed(0) + '%';
+        $pct.textContent = progress.toFixed(0);
+      }, 300);
+    }
 
-      if (!res.ok || !data.ok) {
-        alert(data.error || 'No se pudo generar la vista previa.');
-        $previewCard.style.display = 'none';
+    function endProgress() {
+      if (timer) clearInterval(timer);
+      $bar.style.width = '100%';
+      $pct.textContent = '100';
+    }
+
+    function showOverlay() {
+      $overlay.style.display = 'flex';
+      $overlay.setAttribute('aria-hidden', 'false');
+    }
+    function hideOverlay() {
+      $overlay.style.display = 'none';
+      $overlay.setAttribute('aria-hidden', 'true');
+    }
+
+    // Submit: genera y descarga el DOCX con overlay + barra de progreso controlada por evento
+    $form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+
+      if (!$pdfs.files.length) {
+        alert('Adjunta al menos un PDF.');
         return;
       }
 
-      // Pintar tabla
-      $previewRows.innerHTML = '';
-      $previewDetails.innerHTML = '';
-      for (const r of data.resultados) {
-        const tr = document.createElement('tr');
-        tr.innerHTML = `
-          <td>${r.filename}</td>
-          <td>${r.categoria}</td>
-          <td><code>${r.txt_name}</code></td>
-          <td class="right">${r.tokens.toLocaleString()}</td>`;
-        $previewRows.appendChild(tr);
-
-        const det = document.createElement('details');
-        const sum = document.createElement('summary');
-        sum.innerHTML = `<b>${r.txt_name}</b> — ${r.filename} — <i>~${r.tokens.toLocaleString()} tokens</i>`;
-        const pre = document.createElement('pre');
-        pre.textContent = r.preview;
-        det.appendChild(sum);
-        det.appendChild(pre);
-        $previewDetails.appendChild(det);
-      }
-      $previewTotal.textContent = Number(data.total_tokens || 0).toLocaleString();
-      $previewCard.style.display = 'block';
-      $previewCard.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    });
-
-    // 2) Generar y descargar DOCX directamente (manteniendo la página)
-    $form.addEventListener('submit', async (e) => {
-      e.preventDefault();
+      // Armar FormData asegurando incluir todos los PDFs
       const fd = new FormData($form);
-      // Asegurar que vayan los archivos
       fd.delete('pdfs');
       for (const f of $pdfs.files) fd.append('pdfs', f);
 
-      const res = await fetch('/generate-docx', { method: 'POST', body: fd });
-      if (!res.ok) {
-        const text = await res.text();
-        alert(text || 'Error al generar el informe.');
-        return;
+      // Mostrar overlay y arrancar progreso
+      const oldText = $btn.textContent;
+      showOverlay();
+      startProgress();
+      $btn.disabled = true;
+      $btn.textContent = 'Generando…';
+
+      try {
+        const res = await fetch('/generate-docx', { method: 'POST', body: fd });
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(text || 'Error al generar el informe.');
+        }
+
+        const blob = await res.blob();
+
+        // Completa al 100% y descarga
+        endProgress();
+
+        // Obtener nombre de archivo desde Content-Disposition si está presente
+        let filename = 'Informe.docx';
+        const cd = res.headers.get('Content-Disposition');
+        if (cd) {
+          const m = /filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i.exec(cd);
+          const raw = decodeURIComponent((m && (m[1] || m[2] || '')).trim());
+          if (raw) filename = raw;
+        }
+
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = filename;
+        document.body.appendChild(a); a.click();
+        a.remove(); URL.revokeObjectURL(url);
+
+      } catch (err) {
+        if (timer) clearInterval(timer);
+        alert(err.message || 'Ocurrió un error.');
+      } finally {
+        hideOverlay();
+        $btn.disabled = false;
+        $btn.textContent = oldText;
       }
-      const blob = await res.blob();
-      // Nombre de archivo desde cabecera (si existe) o por defecto
-      let filename = 'Informe.docx';
-      const cd = res.headers.get('Content-Disposition');
-      if (cd) {
-        const m = /filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i.exec(cd);
-        const raw = decodeURIComponent((m && (m[1] || m[2] || '')).trim());
-        if (raw) filename = raw;
-      }
-      // Descargar
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url; a.download = filename;
-      document.body.appendChild(a); a.click();
-      a.remove(); URL.revokeObjectURL(url);
     });
   </script>
 
