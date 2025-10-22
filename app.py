@@ -14,8 +14,8 @@ USER_TEMPLATES_DIR = os.path.join(BASE_DIR, TEMPLATE_FOLDER_USER)
 
 # Candidatos de plantilla (en orden de prioridad)
 CANDIDATE_PLANTILLAS = [
-    os.path.join(USER_TEMPLATES_DIR, "plantilla.docx"),
-    os.path.join(BASE_DIR, "plantilla.docx"),
+    os.path.join(USER_TEMPLATES_DIR, "plantilla.docx"),  # <- user_templates/plantilla.docx
+    os.path.join(BASE_DIR, "plantilla.docx"),            # raíz
     os.path.join(BASE_DIR, "templates", "plantilla.docx"),
     os.path.join(BASE_DIR, "template", "plantilla.docx"),
 ]
@@ -25,7 +25,6 @@ PLANTILLA_PATH = next((p for p in CANDIDATE_PLANTILLAS if os.path.exists(p)), No
 MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 MAX_CHARS_GPT = 12000
 ESTIMAR_MODO = "limpio"  # "limpio" | "claves"
-MAX_PDFS_IA = int(os.getenv("MAX_PDFS_IA", "13"))  # ← umbral para usar IA
 
 # ====== App / carpetas ======
 app = Flask(__name__)
@@ -139,7 +138,7 @@ def generar_docx(datos: dict, plantilla_path: str, salida_path: str):
     for table in doc.tables:
         for row in table.rows:
             for cell in table.rows[0].table.rows[0].cells if False else []:
-                pass
+                pass  # (placeholder para evitar lints)
         for row in doc.tables:
             for r in row.rows:
                 for cell in r.cells:
@@ -154,12 +153,11 @@ def redactar_vip_con_gpt(paciente: str, insumo: str) -> str:
     api_key = os.getenv("OPENAI_API_KEY") or os.getenv("openai_api_key")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY no configurada")
+
     try:
         from openai import OpenAI
-        client = OpenAI(
-            api_key=api_key,
-            timeout=float(os.getenv("OPENAI_REQUEST_TIMEOUT", "60"))  # opcional
-        )
+        client = OpenAI(api_key=api_key)
+
         insumo = insumo[:MAX_CHARS_GPT]
 
         system_msg = (
@@ -216,6 +214,7 @@ INSUMO:
         )
 
         texto = resp.choices[0].message.content.strip()
+        # Normalización defensiva de viñetas
         partes = texto.split("\n")
         limpio = []
         en_reco = False
@@ -228,6 +227,7 @@ INSUMO:
                 ln = ln.lstrip("•- ").strip()
             limpio.append(ln)
         return "\n".join(limpio).strip()
+
     except Exception as e:
         print("Error GPT:", e)
         traceback.print_exc()
@@ -266,21 +266,17 @@ def generate_docx():
 
     # Procesar PDFs y armar insumo
     cat_a_texto = {}
-    total_bytes = 0
     for i, pdf in enumerate(archivos):
         if not pdf.filename.lower().endswith(".pdf"):
             continue
         ruta_pdf = os.path.join(UPLOAD_FOLDER, pdf.filename)
         pdf.save(ruta_pdf)
-        try:
-            total_bytes += os.path.getsize(ruta_pdf)
-        except OSError:
-            pass
 
         crudo = extraer_texto_pdf(ruta_pdf)
         limpio = limpiar_texto(crudo)
         categoria = clasificar(limpio)
 
+        # Guardar .txt por examen 
         salida_fn = f"{i+1:02d}_{categoria}.txt"
         ruta_txt = os.path.join(OUTPUT_FOLDER, salida_fn)
         with open(ruta_txt, "w", encoding="utf-8") as f:
@@ -293,29 +289,13 @@ def generate_docx():
         bloques.append(f"### {cat}\n" + "\n".join(textos))
     insumo_completo = "\n\n".join(bloques).strip()
 
+    if not os.getenv("OPENAI_API_KEY") and not os.getenv("openai_api_key"):
+        return "Error: OPENAI_API_KEY no configurada en el entorno.", 400
     if not insumo_completo:
         return "Error: no se pudo construir el texto base de los PDFs.", 400
 
     paciente = f"{nombre} {ape1} {ape2}".strip()
-
-    # ----- CLAVE PARA DESCARTAR RAM/TIMEOUT -----
-    def _resumen_local(catmap):
-        partes = []
-        for cat, textos in catmap.items():
-            joined = "\n".join(textos)
-            snippet = "\n".join(joined.splitlines()[:3]).strip()
-            snippet = re.sub(r'\s+', ' ', snippet)[:500]
-            partes.append(f"{cat}: {snippet}")
-        return "\n\n".join(partes) or "(Contenido pendiente)"
-
-    if len(archivos) > MAX_PDFS_IA:
-        # Carga alta → NO usar IA (evita 500 por timeout/RAM)
-        cuerpo = "(Se omitió IA por carga alta)\n\n" + _resumen_local(cat_a_texto)
-    else:
-        if not os.getenv("OPENAI_API_KEY") and not os.getenv("openai_api_key"):
-            return "Error: OPENAI_API_KEY no configurada en el entorno.", 400
-        cuerpo = redactar_vip_con_gpt(paciente, insumo_completo)
-    # ---------------------------------------------
+    cuerpo = redactar_vip_con_gpt(paciente, insumo_completo)
 
     # Generar DOCX
     datos = {
@@ -327,28 +307,14 @@ def generate_docx():
         "APELLIDO": apellido,
         "CUERPO": cuerpo or "(Contenido pendiente)"
     }
+    salida_docx = os.path.join(OUTPUT_FOLDER, f"Informe_{apellido or 'Paciente'}.docx")
 
-    total_mb = round(total_bytes / (1024*1024), 2)
-    nombre_docx = f"Informe_{apellido or 'Paciente'}_{total_mb}MB.docx"
-    salida_docx = os.path.join(OUTPUT_FOLDER, nombre_docx)
-
+    # Usa la ruta absoluta detectada para la plantilla
     if not PLANTILLA_PATH or not os.path.exists(PLANTILLA_PATH):
         return "Error: no se encontró 'plantilla.docx'. Ubícala en user_templates/, templates/ o raíz.", 500
     generar_docx(datos, PLANTILLA_PATH, salida_docx)
 
-    # Sanity check antes de enviar
-    try:
-        sz = os.path.getsize(salida_docx)
-        if sz <= 0:
-            return "El DOCX se generó vacío o no existe.", 500
-    except Exception as e:
-        return f"No se pudo acceder al DOCX generado: {e}", 500
-
-    resp = send_file(salida_docx, as_attachment=True, download_name=nombre_docx)
-    resp.headers["X-Upload-MB"] = str(total_mb)
-    resp.headers["X-PDF-Count"] = str(len(archivos))
-    resp.headers["X-IA-Used"] = "false" if len(archivos) > MAX_PDFS_IA else "true"
-    return resp
+    return send_file(salida_docx, as_attachment=True, download_name=os.path.basename(salida_docx))
 
 if __name__ == "__main__":
     app.run(debug=True)
