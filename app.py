@@ -241,6 +241,8 @@ def home():
 
 @app.route("/generate-docx", methods=["POST"])
 def generate_docx():
+    import gc
+
     # Campos
     nombre = request.form.get("nombre", "").strip()
     ape1   = request.form.get("ape1", "").strip()
@@ -264,40 +266,88 @@ def generate_docx():
     hoy = datetime.now()
     fecha_str = f"Lima, {hoy.day} de {meses[hoy.month-1]} del {hoy.year}"
 
-    # Procesar PDFs y armar insumo
+    # --- Procesar PDFs con bajo uso de RAM ---
     cat_a_texto = {}
+    total_bytes = 0
+    detalles_tamano = []  # [(nombre, mb)]
+
     for i, pdf in enumerate(archivos):
-        if not pdf.filename.lower().endswith(".pdf"):
+        fn_lower = pdf.filename.lower()
+        if not fn_lower.endswith(".pdf"):
             continue
+
+        # Guardar a disco (evita retener en RAM)
         ruta_pdf = os.path.join(UPLOAD_FOLDER, pdf.filename)
         pdf.save(ruta_pdf)
 
-        crudo = extraer_texto_pdf(ruta_pdf)
+        # Medir tamaño para reporte
+        try:
+            size_b = os.path.getsize(ruta_pdf)
+        except Exception:
+            size_b = 0
+        total_bytes += size_b
+        detalles_tamano.append((pdf.filename, round(size_b / (1024*1024), 2)))
+
+        # Extraer texto y liberar inmediatamente
+        try:
+            with pdfplumber.open(ruta_pdf) as p:
+                partes = []
+                for page in p.pages:
+                    txt = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
+                    if txt:
+                        partes.append(txt.strip())
+                crudo = "\n\n".join(partes)
+            # en este punto 'p' y páginas quedan liberados
+        except Exception as e:
+            # Si un PDF falla, seguimos con los demás
+            print(f"[WARN] Error leyendo {pdf.filename}: {e}")
+            continue
+
         limpio = limpiar_texto(crudo)
         categoria = clasificar(limpio)
 
-        # Guardar .txt por examen 
+        # Guardar .txt por examen (igual que antes)
         salida_fn = f"{i+1:02d}_{categoria}.txt"
         ruta_txt = os.path.join(OUTPUT_FOLDER, salida_fn)
-        with open(ruta_txt, "w", encoding="utf-8") as f:
-            f.write(limpio)
+        try:
+            with open(ruta_txt, "w", encoding="utf-8") as f:
+                f.write(limpio)
+        except Exception as e:
+            print(f"[WARN] No se pudo escribir {ruta_txt}: {e}")
 
         cat_a_texto.setdefault(categoria, []).append(limpio)
 
+        # Liberar referencias grandes y forzar GC
+        del crudo, limpio
+        gc.collect()
+
+    # Armar insumo completo (como ya hacías)
     bloques = []
     for cat, textos in cat_a_texto.items():
         bloques.append(f"### {cat}\n" + "\n".join(textos))
     insumo_completo = "\n\n".join(bloques).strip()
 
-    if not os.getenv("OPENAI_API_KEY") and not os.getenv("openai_api_key"):
-        return "Error: OPENAI_API_KEY no configurada en el entorno.", 400
-    if not insumo_completo:
-        return "Error: no se pudo construir el texto base de los PDFs.", 400
+    # Reportar MB subidos vía header (no cambia la lógica de respuesta)
+    total_mb = round(total_bytes / (1024*1024), 2)
 
+    # Validaciones previas a IA (idénticas a tu flujo)
+    if not os.getenv("OPENAI_API_KEY") and not os.getenv("openai_api_key"):
+        resp = app.make_response("Error: OPENAI_API_KEY no configurada en el entorno.")
+        resp.status_code = 400
+        resp.headers["X-Upload-Total-MB"] = str(total_mb)
+        return resp
+
+    if not insumo_completo:
+        resp = app.make_response("Error: no se pudo construir el texto base de los PDFs.")
+        resp.status_code = 400
+        resp.headers["X-Upload-Total-MB"] = str(total_mb)
+        return resp
+
+    # Una sola llamada a OpenAI (igual que antes)
     paciente = f"{nombre} {ape1} {ape2}".strip()
     cuerpo = redactar_vip_con_gpt(paciente, insumo_completo)
 
-    # Generar DOCX
+    # Generar DOCX (sin cambios)
     datos = {
         "FECHA": fecha_str,
         "SEXO_TRATO": trato,
@@ -309,12 +359,20 @@ def generate_docx():
     }
     salida_docx = os.path.join(OUTPUT_FOLDER, f"Informe_{apellido or 'Paciente'}.docx")
 
-    # Usa la ruta absoluta detectada para la plantilla
     if not PLANTILLA_PATH or not os.path.exists(PLANTILLA_PATH):
-        return "Error: no se encontró 'plantilla.docx'. Ubícala en user_templates/, templates/ o raíz.", 500
+        resp = app.make_response("Error: no se encontró 'plantilla.docx'. Ubícala en user_templates/, templates/ o raíz.")
+        resp.status_code = 500
+        resp.headers["X-Upload-Total-MB"] = str(total_mb)
+        return resp
+
     generar_docx(datos, PLANTILLA_PATH, salida_docx)
 
-    return send_file(salida_docx, as_attachment=True, download_name=os.path.basename(salida_docx))
+    # Respuesta con el archivo + headers informativos de tamaño subido
+    resp = send_file(salida_docx, as_attachment=True, download_name=os.path.basename(salida_docx))
+    resp.headers["X-Upload-Total-MB"] = str(total_mb)
+    # (opcional) detalle por archivo, útil en logs cliente
+    resp.headers["X-Upload-Files"] = json.dumps(detalles_tamano, ensure_ascii=False)
+    return resp
 
 if __name__ == "__main__":
     app.run(debug=True)
